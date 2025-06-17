@@ -1,4 +1,4 @@
-module robinlecouteur/go-bluetooth
+module github.com/robinlecouteur/go-bluetooth
 
 go 1.20
 
