@@ -1,4 +1,4 @@
-module tinygo.org/x/bluetooth
+module robinlecouteur/go-bluetooth
 
 go 1.20
 
