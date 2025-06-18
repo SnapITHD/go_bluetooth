@@ -15,12 +15,14 @@ import (
 const defaultAdapter = "hci0"
 
 type Adapter struct {
-	id                   string
-	scanCancelChan       chan struct{}
-	bus                  *dbus.Conn
-	bluez                dbus.BusObject // object at /
-	adapter              dbus.BusObject // object at /org/bluez/hciX
-	address              string
+	id             string
+	scanCancelChan chan struct{}
+	bus            *dbus.Conn
+	bluez          dbus.BusObject // object at /
+	adapter        dbus.BusObject // object at /org/bluez/hciX
+	agent          *agent         // pairing agent
+	address        string
+
 	defaultAdvertisement *Advertisement
 
 	connectHandler func(device Device, connected bool)
@@ -52,6 +54,7 @@ func (a *Adapter) Enable() (err error) {
 	a.bus = bus
 	a.bluez = a.bus.Object("org.bluez", dbus.ObjectPath("/"))
 	a.adapter = a.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez/"+a.id))
+	a.agent = newAgent(a) // Initialize agen
 	addr, err := a.adapter.GetProperty("org.bluez.Adapter1.Address")
 	if err != nil {
 		if err, ok := err.(dbus.Error); ok && err.Name == "org.freedesktop.DBus.Error.UnknownObject" {
@@ -62,6 +65,14 @@ func (a *Adapter) Enable() (err error) {
 	addr.Store(&a.address)
 
 	return nil
+}
+
+// setupAgent registers the agent with the given PIN code
+func (a *Adapter) setupAgent(pinCode string) error {
+	if a.agent == nil {
+		return errors.New("bluetooth: adapter not enabled")
+	}
+	return a.agent.register(pinCode)
 }
 
 func (a *Adapter) Address() (MACAddress, error) {
