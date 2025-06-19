@@ -53,8 +53,8 @@ func (a *Adapter) Enable() (err error) {
 	}
 	a.bus = bus
 	a.bluez = a.bus.Object("org.bluez", dbus.ObjectPath("/"))
-	a.adapter = a.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez/"+a.id))
-	a.agent = newAgent(a) // Initialize agen
+	a.adapter = a.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez/"+a.id)) // Default is hci0
+
 	addr, err := a.adapter.GetProperty("org.bluez.Adapter1.Address")
 	if err != nil {
 		if err, ok := err.(dbus.Error); ok && err.Name == "org.freedesktop.DBus.Error.UnknownObject" {
@@ -63,16 +63,9 @@ func (a *Adapter) Enable() (err error) {
 		return fmt.Errorf("could not activate BlueZ adapter: %w", err)
 	}
 	addr.Store(&a.address)
-
+	a.agent = newAgent(a)
+	a.agent.register()
 	return nil
-}
-
-// setupAgent registers the agent with the given PIN code
-func (a *Adapter) setupAgent(pinCode string) error {
-	if a.agent == nil {
-		return errors.New("bluetooth: adapter not enabled")
-	}
-	return a.agent.register(pinCode)
 }
 
 func (a *Adapter) Address() (MACAddress, error) {

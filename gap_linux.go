@@ -51,8 +51,6 @@ var (
 var errAdvertisementNotStarted = errors.New("bluetooth: advertisement is not started")
 var errAdvertisementAlreadyStarted = errors.New("bluetooth: advertisement is already started")
 var errAdaptorNotPowered = errors.New("bluetooth: adaptor is not powered")
-var errAgentAlreadyExists = errors.New("bluetooth: agent already registered")
-var errDeviceNotPaired = errors.New("bluetooth: device is not paired")
 
 // Unique ID per advertisement (to generate a unique object path).
 var advertisementID uint64
@@ -75,10 +73,9 @@ type Advertisement struct {
 
 // agent handles Bluetooth pairing authentication
 type agent struct {
-	adapter    *Adapter
-	path       dbus.ObjectPath
-	pinCode    string
-	registered bool
+	adapter *Adapter
+	path    dbus.ObjectPath
+	pinCode string
 }
 
 // DefaultAdvertisement returns the default advertisement instance but does not
@@ -681,10 +678,8 @@ func (d Device) Pair(pinCode string) error {
 		return nil // Already paired
 	}
 
-	// Setup agent for PIN handling
-	if err := d.adapter.setupAgent(pinCode); err != nil {
-		return err
-	}
+	// Set Pin
+	d.adapter.agent.pinCode = pinCode
 
 	// Pair with device
 	call := d.device.Call("org.bluez.Device1.Pair", 0)
@@ -741,16 +736,7 @@ func newAgent(adapter *Adapter) *agent {
 }
 
 // register exports and registers the agent with BlueZ
-func (a *agent) register(pinCode string) error {
-	if a.registered {
-		if a.pinCode != pinCode {
-			a.pinCode = pinCode // Update PIN code
-		}
-		return nil
-	}
-
-	a.pinCode = pinCode
-
+func (a *agent) register() error {
 	// Export agent object to D-Bus
 	if err := a.adapter.bus.Export(a, a.path, bluezAgentInterface); err != nil {
 		return fmt.Errorf("bluetooth: failed to export agent: %w", err)
@@ -769,34 +755,7 @@ func (a *agent) register(pinCode string) error {
 	// Request default agent
 	call = agentManager.Call(bluezAgentManager+".RequestDefaultAgent", 0, a.path)
 	if call.Err != nil {
-		a.unregister()
 		return fmt.Errorf("bluetooth: failed to request default agent: %w", call.Err)
-	}
-
-	a.registered = true
-	return nil
-}
-
-// unregister removes the agent from BlueZ and unexports from D-Bus
-func (a *agent) unregister() error {
-	if !a.registered {
-		return nil
-	}
-
-	// Get agent manager object
-	agentManager := a.adapter.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez"))
-
-	// Unregister agent
-	call := agentManager.Call(bluezAgentManager+".UnregisterAgent", 0, a.path)
-
-	// Unexport from D-Bus
-	a.adapter.bus.Export(nil, a.path, bluezAgentInterface)
-
-	a.registered = false
-	a.pinCode = ""
-
-	if call.Err != nil {
-		return fmt.Errorf("bluetooth: failed to unregister agent: %w", call.Err)
 	}
 
 	return nil
@@ -807,20 +766,14 @@ func (a *agent) unregister() error {
 
 // RequestPinCode is called when BlueZ needs a PIN code for legacy pairing
 func (a *agent) RequestPinCode(device dbus.ObjectPath) (string, *dbus.Error) {
-	if a.pinCode != "" {
-		return a.pinCode, nil
-	}
-	return "", dbus.MakeFailedError(errors.New("no PIN code available"))
+	return a.pinCode, nil
 }
 
 // RequestPasskey is called when BlueZ needs a numeric passkey (6-digit)
 func (a *agent) RequestPasskey(device dbus.ObjectPath) (uint32, *dbus.Error) {
-	if a.pinCode != "" {
-		var passkey uint32
-		fmt.Sscanf(a.pinCode, "%d", &passkey)
-		return passkey, nil
-	}
-	return 0, dbus.MakeFailedError(errors.New("no passkey available"))
+	var passkey uint32
+	fmt.Sscanf(a.pinCode, "%d", &passkey)
+	return passkey, nil
 }
 
 // RequestConfirmation is called for "Just Works" pairing or to confirm a passkey
@@ -845,6 +798,5 @@ func (a *agent) Cancel() *dbus.Error {
 
 // Release is called when the agent is released by BlueZ
 func (a *agent) Release() *dbus.Error {
-	a.registered = false
 	return nil
 }
