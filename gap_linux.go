@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"strconv"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
@@ -71,11 +72,49 @@ type Advertisement struct {
 	sigCh chan *dbus.Signal
 }
 
+// PinCodeHandler is a function type that provides PIN codes during pairing
+// It receives the device path and should return the PIN code to use
+type PinCodeHandler func(device dbus.ObjectPath) string
+
+// PasskeyHandler is a function type that provides numeric passkeys during pairing
+// It receives the device path and should return a 6-digit numeric passkey
+type PasskeyHandler func(device dbus.ObjectPath) uint32
+
+// ConfirmationHandler is a function type that handles passkey confirmation during pairing
+// It receives the device path and passkey, should return true to confirm or false to reject
+type ConfirmationHandler func(device dbus.ObjectPath, passkey uint32) bool
+
+// AuthorizationHandler is a function type that handles connection authorization
+// It receives the device path and should return true to authorize or false to reject
+type AuthorizationHandler func(device dbus.ObjectPath) bool
+
+// ServiceAuthorizationHandler is a function type that handles service-specific authorization
+// It receives the device path and service UUID, should return true to authorize or false to reject
+type ServiceAuthorizationHandler func(device dbus.ObjectPath, uuid string) bool
+
+// AgentCapability represents the input/output capabilities of the agent
+type AgentCapability string
+
+const (
+	AgentCapabilityDisplayOnly     AgentCapability = "DisplayOnly"
+	AgentCapabilityDisplayYesNo    AgentCapability = "DisplayYesNo"
+	AgentCapabilityKeyboardOnly    AgentCapability = "KeyboardOnly"
+	AgentCapabilityNoInputNoOutput AgentCapability = "NoInputNoOutput"
+	AgentCapabilityKeyboardDisplay AgentCapability = "KeyboardDisplay"
+)
+
 // agent handles Bluetooth pairing authentication
 type agent struct {
-	adapter *Adapter
-	path    dbus.ObjectPath
-	pinCode string
+	adapter    *Adapter
+	path       dbus.ObjectPath
+	capability AgentCapability
+
+	// Handler callbacks
+	pinCodeHandler              PinCodeHandler
+	passkeyHandler              PasskeyHandler
+	confirmationHandler         ConfirmationHandler
+	authorizationHandler        AuthorizationHandler
+	serviceAuthorizationHandler ServiceAuthorizationHandler
 }
 
 // DefaultAdvertisement returns the default advertisement instance but does not
@@ -536,17 +575,41 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	return device, nil
 }
 
+// Remove removes this device from the adapter
+// This will unpair the device and remove it from BlueZ's cache
+func (d Device) Remove() error {
+	// Disconnect first if connected
+	connected, err := d.IsConnected()
+	if err == nil && connected {
+		d.Disconnect()
+		// Don't wait for disconnect to complete
+	}
+	
+	// Call the connect handler if set
+	if d.adapter.connectHandler != nil {
+		d.adapter.connectHandler(d, false)
+	}
+	
+	// Remove the device from the adapter
+	call := d.adapter.adapter.Call("org.bluez.Adapter1.RemoveDevice", 0, d.device.Path())
+	if call.Err != nil {
+		if dbusErr, ok := call.Err.(dbus.Error); ok && dbusErr.Name == "org.bluez.Error.DoesNotExist" {
+			return fmt.Errorf("bluetooth: device not found")
+		}
+		return fmt.Errorf("bluetooth: failed to remove device: %w", call.Err)
+	}
+	
+	return nil
+}
 // Disconnect from the BLE device. This method is non-blocking and does not
 // wait until the connection is fully gone.
 func (d Device) Disconnect() error {
 	if d.adapter.connectHandler != nil {
 		d.adapter.connectHandler(d, false)
 	}
-
-	// we don't call our cancel function here, instead we wait for the
-	// property change in `watchForConnect` and cancel things then
 	return d.device.Call("org.bluez.Device1.Disconnect", 0).Err
 }
+
 
 // RequestConnectionParams requests a different connection latency and timeout
 // of the given device connection. Fields that are unset will be left alone.
@@ -667,8 +730,9 @@ func (d *Device) parseProperties(props *map[string]dbus.Variant) error {
 	return nil
 }
 
-// Pair pairs with the device using the provided PIN code
-func (d Device) Pair(pinCode string) error {
+// PairWithCode pairs with the device using the provided PIN code
+// This is a convenience method that automatically sets a handler for the specific PIN code
+func (d Device) PairWithCode(pinCode string) error {
 	// Check if already paired
 	paired, err := d.device.GetProperty("org.bluez.Device1.Paired")
 	if err != nil {
@@ -678,8 +742,42 @@ func (d Device) Pair(pinCode string) error {
 		return nil // Already paired
 	}
 
-	// Set Pin
-	d.adapter.agent.pinCode = pinCode
+	// Create and configure agent if not exists
+	agent := d.adapter.DefaultAgent()
+	// Just update the handler temporarily
+	agent.SetPinCodeHandler(func(device dbus.ObjectPath) string {
+		return pinCode
+	})
+
+	agent.SetPasskeyHandler(func(device dbus.ObjectPath) uint32 {
+		val, _ := strconv.ParseUint(pinCode, 10, 32)
+		return uint32(val)
+	})
+
+	// Pair with device
+	call := d.device.Call("org.bluez.Device1.Pair", 0)
+	if call.Err != nil {
+		return fmt.Errorf("bluetooth: failed to pair device: %w", call.Err)
+	}
+
+	return nil
+}
+
+// Pair pairs with the device using the provided PIN code
+func (d Device) Pair() error {
+	// Check if already paired
+	paired, err := d.device.GetProperty("org.bluez.Device1.Paired")
+	if err != nil {
+		return fmt.Errorf("bluetooth: failed to check paired status: %w", err)
+	}
+	if paired.Value().(bool) {
+		return nil // Already paired
+	}
+
+	// Check if agent is registered
+	if d.adapter.defaultAgent == nil {
+		return fmt.Errorf("bluetooth: no agent registered, use adapter.DefaultAgent().Register() or PairWithCode()")
+	}
 
 	// Pair with device
 	call := d.device.Call("org.bluez.Device1.Pair", 0)
@@ -727,16 +825,50 @@ func (d Device) IsTrusted() (bool, error) {
 	return trusted.Value().(bool), nil
 }
 
-// newAgent creates a new agent for the given adapter
-func newAgent(adapter *Adapter) *agent {
-	return &agent{
-		adapter: adapter,
-		path:    dbus.ObjectPath(fmt.Sprintf("/org/tinygo/bluetooth/adapter/%s/agent", adapter.id)),
+// DefaultAgent returns the default agent instance but does not configure or register it.
+func (a *Adapter) DefaultAgent() *agent {
+	if a.defaultAgent == nil {
+		a.defaultAgent = &agent{
+			adapter:    a,
+			path:       dbus.ObjectPath(fmt.Sprintf("/org/tinygo/bluetooth/adapter/%s/agent", a.id)),
+			capability: AgentCapabilityKeyboardOnly, // Default capability
+		}
 	}
+	return a.defaultAgent
+}
+
+// SetCapabilitys sets the agent capability
+func (agent *agent) SetCapability(capability AgentCapability) {
+	agent.capability = capability
+}
+
+// SetPinCodeHandler sets the PIN code handler
+func (agent *agent) SetPinCodeHandler(handler PinCodeHandler) {
+	agent.pinCodeHandler = handler
+}
+
+// SetPasskeyHandler sets the passkey handler
+func (agent *agent) SetPasskeyHandler(handler PasskeyHandler) {
+	agent.passkeyHandler = handler
+}
+
+// SetConfirmationHandler sets the confirmation handler
+func (agent *agent) SetConfirmationHandler(handler ConfirmationHandler) {
+	agent.confirmationHandler = handler
+}
+
+// SetAuthorizationHandler sets the authorization handler
+func (agent *agent) SetAuthorizationHandler(handler AuthorizationHandler) {
+	agent.authorizationHandler = handler
+}
+
+// SetServiceAuthorizationHandler sets the service authorization handler
+func (agent *agent) SetServiceAuthorizationHandler(handler ServiceAuthorizationHandler) {
+	agent.serviceAuthorizationHandler = handler
 }
 
 // register exports and registers the agent with BlueZ
-func (a *agent) register() error {
+func (a *agent) Register() error {
 	// Export agent object to D-Bus
 	if err := a.adapter.bus.Export(a, a.path, bluezAgentInterface); err != nil {
 		return fmt.Errorf("bluetooth: failed to export agent: %w", err)
@@ -746,7 +878,7 @@ func (a *agent) register() error {
 	agentManager := a.adapter.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez"))
 
 	// Register agent with BlueZ
-	call := agentManager.Call(bluezAgentManager+".RegisterAgent", 0, a.path, "KeyboardOnly")
+	call := agentManager.Call(bluezAgentManager+".RegisterAgent", 0, a.path, a.capability)
 	if call.Err != nil {
 		a.adapter.bus.Export(nil, a.path, bluezAgentInterface)
 		return fmt.Errorf("bluetooth: failed to register agent: %w", call.Err)
@@ -765,38 +897,67 @@ func (a *agent) register() error {
 // These are called by BlueZ via D-Bus during pairing
 
 // RequestPinCode is called when BlueZ needs a PIN code for legacy pairing
-func (a *agent) RequestPinCode(device dbus.ObjectPath) (string, *dbus.Error) {
-	return a.pinCode, nil
+func (agent *agent) RequestPinCode(device dbus.ObjectPath) (string, *dbus.Error) {
+	if agent.pinCodeHandler != nil {
+		return agent.pinCodeHandler(device), nil
+	}
+	return "", dbus.MakeFailedError(fmt.Errorf("no PIN code handler set"))
 }
 
 // RequestPasskey is called when BlueZ needs a numeric passkey (6-digit)
-func (a *agent) RequestPasskey(device dbus.ObjectPath) (uint32, *dbus.Error) {
-	var passkey uint32
-	fmt.Sscanf(a.pinCode, "%d", &passkey)
-	return passkey, nil
+func (agent *agent) RequestPasskey(device dbus.ObjectPath) (uint32, *dbus.Error) {
+	if agent.passkeyHandler != nil {
+		return agent.passkeyHandler(device), nil
+	}
+	// Fallback to pin code handler if passkey handler not set
+	if agent.pinCodeHandler != nil {
+		pinCode := agent.pinCodeHandler(device)
+		var passkey uint32
+		fmt.Sscanf(pinCode, "%d", &passkey)
+		return passkey, nil
+	}
+	return 0, dbus.MakeFailedError(fmt.Errorf("no passkey or PIN code handler set"))
 }
 
 // RequestConfirmation is called for "Just Works" pairing or to confirm a passkey
-func (a *agent) RequestConfirmation(device dbus.ObjectPath, passkey uint32) *dbus.Error {
-	return nil // Auto-confirm
+func (agent *agent) RequestConfirmation(device dbus.ObjectPath, passkey uint32) *dbus.Error {
+	if agent.confirmationHandler != nil {
+		if agent.confirmationHandler(device, passkey) {
+			return nil
+		}
+		return dbus.MakeFailedError(fmt.Errorf("confirmation rejected"))
+	}
+	return nil // Auto-confirm if no handler set
 }
 
 // RequestAuthorization is called to authorize a connection
-func (a *agent) RequestAuthorization(device dbus.ObjectPath) *dbus.Error {
-	return nil // Auto-authorize
+func (agent *agent) RequestAuthorization(device dbus.ObjectPath) *dbus.Error {
+	if agent.authorizationHandler != nil {
+		if agent.authorizationHandler(device) {
+			return nil
+		}
+		return dbus.MakeFailedError(fmt.Errorf("authorization rejected"))
+	}
+	return nil // Auto-authorize if no handler set
 }
 
 // AuthorizeService is called to authorize access to a specific service
-func (a *agent) AuthorizeService(device dbus.ObjectPath, uuid string) *dbus.Error {
-	return nil // Auto-authorize
+func (agent *agent) AuthorizeService(device dbus.ObjectPath, uuid string) *dbus.Error {
+	if agent.serviceAuthorizationHandler != nil {
+		if agent.serviceAuthorizationHandler(device, uuid) {
+			return nil
+		}
+		return dbus.MakeFailedError(fmt.Errorf("service authorization rejected"))
+	}
+	return nil // Auto-authorize if no handler set
 }
 
 // Cancel is called when the authentication request is canceled
-func (a *agent) Cancel() *dbus.Error {
+func (agent *agent) Cancel() *dbus.Error {
 	return nil
 }
 
 // Release is called when the agent is released by BlueZ
-func (a *agent) Release() *dbus.Error {
+func (agent *agent) Release() *dbus.Error {
 	return nil
 }

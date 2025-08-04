@@ -16,7 +16,10 @@ var adapter = bluetooth.DefaultAdapter
 func main() {
 	// Enable BLE interface
 	must("enable BLE stack", adapter.Enable())
-
+	agent := adapter.DefaultAgent()
+	// Set capability type
+	agent.SetCapability(bluetooth.AgentCapabilityKeyboardOnly)
+	agent.Register()
 	scanner := bufio.NewScanner(os.Stdin)
 
 	// Get device name filter from user
@@ -49,35 +52,35 @@ func main() {
 	}
 
 	if !paired {
-		// Get PIN code for pairing
-		fmt.Print("Enter PIN code for pairing (or press Enter for no pin): ")
-		scanner.Scan()
-		pinCode := strings.TrimSpace(scanner.Text())
+		fmt.Printf("Pairing...")
 
-		fmt.Printf("Pairing with PIN: %s...\n", pinCode)
-		err = device.Pair(pinCode)
+		fmt.Print("Enter code (leave empty for no code): ")
+		scanner.Scan()
+		codeResponse := strings.ToLower(strings.TrimSpace(scanner.Text()))
+
+		if codeResponse == "" {
+			err = device.Pair()	
+		}	 else {
+			err = device.PairWithCode(codeResponse)
+		}
+		
 		if err != nil {
 			fmt.Printf("Pairing failed: %v\n", err)
+			paired = false
 		} else {
 			fmt.Printf("Device paired successfully\n")
+			paired = true;
 		}
 
 	} else {
 		fmt.Printf("Device already paired\n")
 	}
 
-	// Trust the device
-	fmt.Print("Trust this device for future connections? (y/N): ")
-	scanner.Scan()
-	trustResponse := strings.ToLower(strings.TrimSpace(scanner.Text()))
-
-	if trustResponse == "y" || trustResponse == "yes" {
-		err = device.TrustDevice()
-		if err != nil {
-			fmt.Printf("Failed to trust device: %v\n", err)
-		} else {
-			fmt.Printf("Device trusted\n")
-		}
+	err = device.TrustDevice()
+	if err != nil {
+		fmt.Printf("Failed to trust device: %v\n", err)
+	} else {
+		fmt.Printf("Device trusted\n")
 	}
 
 	// Print device info
@@ -90,19 +93,20 @@ func main() {
 
 	if removeResponse == "y" || removeResponse == "yes" {
 		fmt.Printf("Removing device %s...\n", device.Address.MAC.String())
-		// Note: RemoveDevice functionality would need to be implemented in the adapter
-		// For now, we'll just disconnect
-		fmt.Printf("Device removal not implemented, disconnecting only\n")
+		device.Remove()
+
+	} else {
+		// Disconnect
+		fmt.Printf("Disconnecting from %s...\n", device.Address.MAC.String())
+		err = device.Disconnect()
+		if err != nil {
+			fmt.Printf("Disconnect error: %v\n", err)
+		} else {
+			fmt.Printf("Disconnected successfully\n")
+		}
 	}
 
-	// Disconnect
-	fmt.Printf("Disconnecting from %s...\n", device.Address.MAC.String())
-	err = device.Disconnect()
-	if err != nil {
-		fmt.Printf("Disconnect error: %v\n", err)
-	} else {
-		fmt.Printf("Disconnected successfully\n")
-	}
+
 }
 
 func scanForDevices(nameFilter string) []bluetooth.ScanResult {

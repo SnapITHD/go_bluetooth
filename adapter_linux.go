@@ -20,9 +20,9 @@ type Adapter struct {
 	bus            *dbus.Conn
 	bluez          dbus.BusObject // object at /
 	adapter        dbus.BusObject // object at /org/bluez/hciX
-	agent          *agent         // pairing agent
 	address        string
 
+	defaultAgent         *agent // pairing agent
 	defaultAdvertisement *Advertisement
 
 	connectHandler func(device Device, connected bool)
@@ -54,7 +54,6 @@ func (a *Adapter) Enable() (err error) {
 	a.bus = bus
 	a.bluez = a.bus.Object("org.bluez", dbus.ObjectPath("/"))
 	a.adapter = a.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez/"+a.id)) // Default is hci0
-
 	addr, err := a.adapter.GetProperty("org.bluez.Adapter1.Address")
 	if err != nil {
 		if err, ok := err.(dbus.Error); ok && err.Name == "org.freedesktop.DBus.Error.UnknownObject" {
@@ -63,8 +62,7 @@ func (a *Adapter) Enable() (err error) {
 		return fmt.Errorf("could not activate BlueZ adapter: %w", err)
 	}
 	addr.Store(&a.address)
-	a.agent = newAgent(a)
-	a.agent.register()
+
 	return nil
 }
 
