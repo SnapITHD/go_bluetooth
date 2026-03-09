@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SnapITHD/go-bluetooth"
+	bluetooth "github.com/SnapITHD/go_bluetooth"
 )
 
 var adapter = bluetooth.DefaultAdapter

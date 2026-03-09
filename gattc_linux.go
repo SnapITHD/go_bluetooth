@@ -4,6 +4,9 @@ package bluetooth
 
 import (
 	"errors"
+	"io"
+	"log"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -132,8 +135,10 @@ type DeviceCharacteristic struct {
 	uuidWrapper
 	adapter                      *Adapter
 	characteristic               dbus.BusObject
-	property                     chan *dbus.Signal // channel where notifications are reported
+	property                     chan *dbus.Signal // channel where notifications are reported (StartNotify path)
 	propertiesChangedMatchOption dbus.MatchOption  // the same value must be passed to RemoveMatchSignal
+	notifyFile                   *os.File          // fd from AcquireNotify (preferred path)
+	notifyStop                   chan struct{}      // closed to stop the AcquireNotify reader goroutine
 }
 
 // UUID returns the UUID for this DeviceCharacteristic.
@@ -238,58 +243,102 @@ func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (n int, err error) 
 func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) error {
 	switch callback {
 	default:
-		if c.property != nil {
+		if c.notifyFile != nil || c.property != nil {
 			return errDupNotif
 		}
 
-		// Start watching for changes in the Value property.
+		// Try AcquireNotify first — BlueZ hands us a raw fd for notification
+		// data, which is more reliable than the PropertiesChanged D-Bus signal.
+		var fd dbus.UnixFDIndex
+		var mtu uint16
+		err := c.characteristic.Call("org.bluez.GattCharacteristic1.AcquireNotify", 0,
+			map[string]dbus.Variant{}).Store(&fd, &mtu)
+		if err == nil {
+			f := os.NewFile(uintptr(fd), "ble-notify")
+			stop := make(chan struct{})
+			c.notifyFile = f
+			c.notifyStop = stop
+			go func() {
+				defer f.Close()
+				buf := make([]byte, int(mtu)+3) // ATT header overhead
+				if mtu == 0 {
+					buf = make([]byte, 517)
+				}
+				for {
+					n, err := f.Read(buf)
+					if err != nil {
+						// io.EOF or pipe closed — notifications stopped
+						return
+					}
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if n > 0 {
+						cp := make([]byte, n)
+						copy(cp, buf[:n])
+						callback(cp)
+					}
+				}
+			}()
+			return nil
+		}
+
+		// AcquireNotify not supported — fall back to StartNotify + PropertiesChanged.
+		log.Printf("AcquireNotify failed (%v), falling back to StartNotify", err)
+
 		c.property = make(chan *dbus.Signal)
 		c.adapter.bus.Signal(c.property)
 		c.propertiesChangedMatchOption = dbus.WithMatchInterface("org.freedesktop.DBus.Properties")
 		c.adapter.bus.AddMatchSignal(c.propertiesChangedMatchOption)
 
-		err := c.characteristic.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err
-		if err != nil {
+		if err := c.characteristic.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err; err != nil {
+			c.adapter.bus.RemoveSignal(c.property)
+			c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
+			c.property = nil
 			return err
 		}
 
+		wantPath := c.characteristic.Path()
 		go func() {
 			for sig := range c.property {
-				if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
-					interfaceName := sig.Body[0].(string)
-					if interfaceName != "org.bluez.GattCharacteristic1" {
-						continue
-					}
-					if sig.Path != c.characteristic.Path() {
-						continue
-					}
-					changes := sig.Body[1].(map[string]dbus.Variant)
-					if value, ok := changes["Value"].Value().([]byte); ok {
-						callback(value)
-					}
+				if sig.Name != "org.freedesktop.DBus.Properties.PropertiesChanged" {
+					continue
+				}
+				interfaceName, _ := sig.Body[0].(string)
+				if interfaceName != "org.bluez.GattCharacteristic1" || sig.Path != wantPath {
+					continue
+				}
+				changes, _ := sig.Body[1].(map[string]dbus.Variant)
+				if value, ok := changes["Value"].Value().([]byte); ok {
+					callback(value)
 				}
 			}
 		}()
-
 		return nil
 
 	case nil:
+		// Disable notifications.
+		if c.notifyFile != nil {
+			close(c.notifyStop)
+			c.notifyFile.Close()
+			c.notifyFile = nil
+			c.notifyStop = nil
+			return nil
+		}
 		if c.property == nil {
 			return nil
 		}
-		// Make the D-Bus call to stop notifications on the characteristic.
 		stopNotifyErr := c.characteristic.Call("org.bluez.GattCharacteristic1.StopNotify", 0).Err
-		// Still clean up other resources if there was an error
 		removeSignalErr := c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
 		c.adapter.bus.RemoveSignal(c.property)
 		close(c.property)
 		c.property = nil
-
-		// If there were errors, prioritize notify err
 		if stopNotifyErr == nil {
 			return removeSignalErr
 		}
-		return stopNotifyErr		
+		return stopNotifyErr
 	}
 }
 

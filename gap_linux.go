@@ -5,9 +5,9 @@ package bluetooth
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
-	"strconv"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
@@ -584,12 +584,12 @@ func (d Device) Remove() error {
 		d.Disconnect()
 		// Don't wait for disconnect to complete
 	}
-	
+
 	// Call the connect handler if set
 	if d.adapter.connectHandler != nil {
 		d.adapter.connectHandler(d, false)
 	}
-	
+
 	// Remove the device from the adapter
 	call := d.adapter.adapter.Call("org.bluez.Adapter1.RemoveDevice", 0, d.device.Path())
 	if call.Err != nil {
@@ -598,9 +598,10 @@ func (d Device) Remove() error {
 		}
 		return fmt.Errorf("bluetooth: failed to remove device: %w", call.Err)
 	}
-	
+
 	return nil
 }
+
 // Disconnect from the BLE device. This method is non-blocking and does not
 // wait until the connection is fully gone.
 func (d Device) Disconnect() error {
@@ -609,7 +610,6 @@ func (d Device) Disconnect() error {
 	}
 	return d.device.Call("org.bluez.Device1.Disconnect", 0).Err
 }
-
 
 // RequestConnectionParams requests a different connection latency and timeout
 // of the given device connection. Fields that are unset will be left alone.
