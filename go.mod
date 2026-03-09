@@ -1,4 +1,4 @@
-module github.com/robinlecouteur/go-bluetooth
+module github.com/SnapITHD/go-bluetooth
 
 go 1.22.1
 
