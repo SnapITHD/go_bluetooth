@@ -4,9 +4,6 @@ package bluetooth
 
 import (
 	"errors"
-	"io"
-	"log"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -135,10 +132,8 @@ type DeviceCharacteristic struct {
 	uuidWrapper
 	adapter                      *Adapter
 	characteristic               dbus.BusObject
-	property                     chan *dbus.Signal // channel where notifications are reported (StartNotify path)
+	property                     chan *dbus.Signal // channel where notifications are reported
 	propertiesChangedMatchOption dbus.MatchOption  // the same value must be passed to RemoveMatchSignal
-	notifyFile                   *os.File          // fd from AcquireNotify (preferred path)
-	notifyStop                   chan struct{}      // closed to stop the AcquireNotify reader goroutine
 }
 
 // UUID returns the UUID for this DeviceCharacteristic.
@@ -234,6 +229,19 @@ func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (n int, err error) 
 	return len(p), nil
 }
 
+// Write writes data to the characteristic using a Write Request (with response).
+// Use this for characteristics that have the "write" flag but not "write-without-response".
+func (c DeviceCharacteristic) Write(p []byte) (n int, err error) {
+	opts := map[string]dbus.Variant{
+		"type": dbus.MakeVariant("request"),
+	}
+	err = c.characteristic.Call("org.bluez.GattCharacteristic1.WriteValue", 0, p, opts).Err
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
 // EnableNotifications enables notifications in the Client Characteristic
 // Configuration Descriptor (CCCD). This means that most peripherals will send a
 // notification with a new value every time the value of the characteristic
@@ -243,50 +251,11 @@ func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (n int, err error) 
 func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) error {
 	switch callback {
 	default:
-		if c.notifyFile != nil || c.property != nil {
+		if c.property != nil {
 			return errDupNotif
 		}
 
-		// Try AcquireNotify first — BlueZ hands us a raw fd for notification
-		// data, which is more reliable than the PropertiesChanged D-Bus signal.
-		var fd dbus.UnixFDIndex
-		var mtu uint16
-		err := c.characteristic.Call("org.bluez.GattCharacteristic1.AcquireNotify", 0,
-			map[string]dbus.Variant{}).Store(&fd, &mtu)
-		if err == nil {
-			f := os.NewFile(uintptr(fd), "ble-notify")
-			stop := make(chan struct{})
-			c.notifyFile = f
-			c.notifyStop = stop
-			go func() {
-				defer f.Close()
-				buf := make([]byte, int(mtu)+3) // ATT header overhead
-				if mtu == 0 {
-					buf = make([]byte, 517)
-				}
-				for {
-					n, err := f.Read(buf)
-					if err != nil {
-						// io.EOF or pipe closed — notifications stopped
-						return
-					}
-					select {
-					case <-stop:
-						return
-					default:
-					}
-					if n > 0 {
-						cp := make([]byte, n)
-						copy(cp, buf[:n])
-						callback(cp)
-					}
-				}
-			}()
-			return nil
-		}
-
-		// AcquireNotify not supported — fall back to StartNotify + PropertiesChanged.
-		log.Printf("AcquireNotify failed (%v), falling back to StartNotify", err)
+		// Use StartNotify + PropertiesChanged signal.
 
 		c.property = make(chan *dbus.Signal)
 		c.adapter.bus.Signal(c.property)
@@ -320,13 +289,6 @@ func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) er
 
 	case nil:
 		// Disable notifications.
-		if c.notifyFile != nil {
-			close(c.notifyStop)
-			c.notifyFile.Close()
-			c.notifyFile = nil
-			c.notifyStop = nil
-			return nil
-		}
 		if c.property == nil {
 			return nil
 		}
