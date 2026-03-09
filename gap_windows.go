@@ -1,6 +1,7 @@
 package bluetooth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"unsafe"
@@ -223,12 +224,19 @@ func getScanResultFromArgs(args *advertisement.BluetoothLEAdvertisementReceivedE
 		Address: adr,
 	}
 
+	winAdv, err := args.GetAdvertisement()
+	if err != nil {
+		return result
+	}
+	defer winAdv.Release()
+
 	var manufacturerData []ManufacturerDataElement
-	if winAdv, err := args.GetAdvertisement(); err == nil && winAdv != nil {
-		vector, _ := winAdv.GetManufacturerData()
-		size, _ := vector.GetSize()
-		for i := uint32(0); i < size; i++ {
-			element, _ := vector.GetAt(i)
+	mVector, _ := winAdv.GetManufacturerData()
+	if mVector != nil {
+		defer mVector.Release()
+		mSize, _ := mVector.GetSize()
+		for i := uint32(0); i < mSize; i++ {
+			element, _ := mVector.GetAt(i)
 			manData := (*advertisement.BluetoothLEManufacturerData)(element)
 			companyID, _ := manData.GetCompanyId()
 			buffer, _ := manData.GetData()
@@ -236,12 +244,13 @@ func getScanResultFromArgs(args *advertisement.BluetoothLEAdvertisementReceivedE
 				CompanyID: companyID,
 				Data:      bufferToSlice(buffer),
 			})
+			buffer.Release()
+			manData.Release()
 		}
 	}
 
 	// Note: the IsRandom bit is never set.
-	advertisement, _ := args.GetAdvertisement()
-	localName, _ := advertisement.GetLocalName()
+	localName, _ := winAdv.GetLocalName()
 	result.AdvertisementPayload = &advertisementFields{
 		AdvertisementFields{
 			LocalName:        localName,
@@ -275,6 +284,9 @@ func (a *Adapter) StopScan() error {
 
 // Device is a connection to a remote peripheral.
 type Device struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	Address Address // the MAC address of the device
 
 	device  *bluetooth.BluetoothLEDevice
@@ -343,7 +355,18 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 		return Device{}, err
 	}
 
-	device := Device{address, bleDevice, newSession}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	device := Device{
+		ctx:    ctx,
+		cancel: cancel,
+
+		Address: address,
+
+		device:  bleDevice,
+		session: newSession,
+	}
+
 	if a.connectHandler != nil {
 		a.connectHandler(device, true)
 	}
@@ -356,6 +379,8 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 func (d Device) Disconnect() error {
 	defer d.device.Release()
 	defer d.session.Release()
+
+	d.cancel()
 
 	if err := d.session.Close(); err != nil {
 		return err
