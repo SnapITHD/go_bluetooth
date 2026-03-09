@@ -1,6 +1,6 @@
 package main
 
-import "github.com/robinlecouteur/go-bluetooth"
+import "github.com/SnapITHD/go-bluetooth"
 
 var adapter = bluetooth.DefaultAdapter
 

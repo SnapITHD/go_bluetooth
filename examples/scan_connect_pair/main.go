@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/robinlecouteur/go-bluetooth"
+	"github.com/SnapITHD/go-bluetooth"
 )
 
 var adapter = bluetooth.DefaultAdapter
@@ -59,17 +59,17 @@ func main() {
 		codeResponse := strings.ToLower(strings.TrimSpace(scanner.Text()))
 
 		if codeResponse == "" {
-			err = device.Pair()	
-		}	 else {
+			err = device.Pair()
+		} else {
 			err = device.PairWithCode(codeResponse)
 		}
-		
+
 		if err != nil {
 			fmt.Printf("Pairing failed: %v\n", err)
 			paired = false
 		} else {
 			fmt.Printf("Device paired successfully\n")
-			paired = true;
+			paired = true
 		}
 
 	} else {
@@ -105,7 +105,6 @@ func main() {
 			fmt.Printf("Disconnected successfully\n")
 		}
 	}
-
 
 }
 
