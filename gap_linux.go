@@ -898,6 +898,17 @@ func (a *agent) Register() error {
 	return nil
 }
 
+// Unregister unregisters the agent from BlueZ.
+func (a *agent) Unregister() error {
+	agentManager := a.adapter.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez"))
+	call := agentManager.Call(bluezAgentManager+".UnregisterAgent", 0, a.path)
+	if call.Err != nil {
+		return fmt.Errorf("bluetooth: failed to unregister agent: %w", call.Err)
+	}
+	a.adapter.bus.Export(nil, a.path, bluezAgentInterface)
+	return nil
+}
+
 // Agent interface implementation methods
 // These are called by BlueZ via D-Bus during pairing
 
