@@ -635,6 +635,40 @@ func (a *Adapter) PowerOn() error {
 	return a.adapter.SetProperty("org.bluez.Adapter1.Powered", dbus.MakeVariant(true))
 }
 
+// ConnectWithPin registers a KeyboardOnly agent with pin set, connects to addr,
+// pairs if needed, and trusts the device. The agent must be registered with the
+// pin before Connect because SC_ONLY devices request the passkey during connection.
+func (a *Adapter) ConnectWithPin(addr Address, pin string) (Device, error) {
+	agent := a.DefaultAgent()
+	agent.Unregister()
+	agent.SetCapability(AgentCapabilityKeyboardOnly)
+	if err := agent.Register(); err != nil {
+		log.Printf("Warning: agent registration: %v", err)
+	}
+	if pin != "" {
+		var passkey uint32
+		fmt.Sscanf(pin, "%d", &passkey)
+		agent.SetPinCodeHandler(func(_ dbus.ObjectPath) string { return pin })
+		agent.SetPasskeyHandler(func(_ dbus.ObjectPath) uint32 { return passkey })
+	}
+
+	device, err := a.Connect(addr, ConnectionParams{})
+	if err != nil {
+		return Device{}, fmt.Errorf("bluetooth: connect failed: %w", err)
+	}
+
+	if paired, _ := device.IsPaired(); !paired {
+		if err := device.PairWithCode(pin); err != nil {
+			log.Printf("Warning: PairWithCode failed (%v), trying plain Pair", err)
+			device.Pair()
+		}
+	}
+	if err := device.TrustDevice(); err != nil {
+		log.Printf("Warning: TrustDevice failed: %v", err)
+	}
+	return device, nil
+}
+
 // SetPairable sets the adapter pairable state and optionally a timeout in seconds.
 // A timeout of 0 means pairable indefinitely.
 func (a *Adapter) SetPairable(pairable bool, timeoutSecs uint32) error {
