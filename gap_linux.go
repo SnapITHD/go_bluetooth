@@ -518,13 +518,15 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	}
 
 	// Read whether this device is already connected.
-	connected, err := device.device.GetProperty("org.bluez.Device1.Connected")
-	if err != nil {
-		return Device{}, err
+	// If the property call fails the device object doesn't exist in BlueZ yet
+	// (e.g. seen only via scan), so treat it as not connected and proceed.
+	alreadyConnected := false
+	if connected, err := device.device.GetProperty("org.bluez.Device1.Connected"); err == nil {
+		alreadyConnected = connected.Value().(bool)
 	}
 
 	// Connect to the device, if not already connected.
-	if !connected.Value().(bool) {
+	if !alreadyConnected {
 		// Start connecting (async).
 		err := device.device.Call("org.bluez.Device1.Connect", 0).Err
 		if err != nil {
@@ -578,11 +580,9 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 // Remove removes this device from the adapter
 // This will unpair the device and remove it from BlueZ's cache
 func (d Device) Remove() error {
-	// Disconnect first if connected
-	connected, err := d.IsConnected()
-	if err == nil && connected {
+	// Disconnect first if connected (ignore error — device may not exist in BlueZ yet).
+	if connected, err := d.IsConnected(); err == nil && connected {
 		d.Disconnect()
-		// Don't wait for disconnect to complete
 	}
 
 	// Call the connect handler if set
