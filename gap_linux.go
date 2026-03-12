@@ -635,17 +635,13 @@ func (a *Adapter) PowerOn() error {
 	return a.adapter.SetProperty("org.bluez.Adapter1.Powered", dbus.MakeVariant(true))
 }
 
-// ConnectWithPin registers a KeyboardOnly agent with pin set, connects to addr,
-// pairs if needed, and trusts the device. The agent must be registered with the
-// pin before Connect because SC_ONLY devices request the passkey during connection.
+// ConnectWithPin connects to addr, pairs if needed using the given pin, and
+// trusts the device. The caller must have already registered a KeyboardOnly
+// agent (via DefaultAgent().Register()) before calling this — SC_ONLY devices
+// request the passkey during connection before an explicit Pair() call.
 func (a *Adapter) ConnectWithPin(addr Address, pin string) (Device, error) {
-	agent := a.DefaultAgent()
-	agent.Unregister()
-	agent.SetCapability(AgentCapabilityKeyboardOnly)
-	if err := agent.Register(); err != nil {
-		log.Printf("Warning: agent registration: %v", err)
-	}
 	if pin != "" {
+		agent := a.DefaultAgent()
 		var passkey uint32
 		fmt.Sscanf(pin, "%d", &passkey)
 		agent.SetPinCodeHandler(func(_ dbus.ObjectPath) string { return pin })
@@ -936,8 +932,11 @@ func (a *agent) Register() error {
 	// Register agent with BlueZ
 	call := agentManager.Call(bluezAgentManager+".RegisterAgent", 0, a.path, a.capability)
 	if call.Err != nil {
-		a.adapter.bus.Export(nil, a.path, bluezAgentInterface)
-		return fmt.Errorf("bluetooth: failed to register agent: %w", call.Err)
+		if dbusErr, ok := call.Err.(dbus.Error); !ok || dbusErr.Name != "org.bluez.Error.AlreadyExists" {
+			a.adapter.bus.Export(nil, a.path, bluezAgentInterface)
+			return fmt.Errorf("bluetooth: failed to register agent: %w", call.Err)
+		}
+		// Already registered — proceed, RequestDefaultAgent will still work.
 	}
 
 	// Request default agent
@@ -950,12 +949,11 @@ func (a *agent) Register() error {
 }
 
 // Unregister unregisters the agent from BlueZ.
+// Ignores errors from BlueZ (e.g. agent was never registered) but always
+// clears the D-Bus export so Register can succeed cleanly.
 func (a *agent) Unregister() error {
 	agentManager := a.adapter.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez"))
-	call := agentManager.Call(bluezAgentManager+".UnregisterAgent", 0, a.path)
-	if call.Err != nil {
-		return fmt.Errorf("bluetooth: failed to unregister agent: %w", call.Err)
-	}
+	agentManager.Call(bluezAgentManager+".UnregisterAgent", 0, a.path)
 	a.adapter.bus.Export(nil, a.path, bluezAgentInterface)
 	return nil
 }
