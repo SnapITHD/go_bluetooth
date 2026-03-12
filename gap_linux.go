@@ -294,7 +294,7 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 	// This appears to be necessary to receive any BLE discovery results at all.
 	defer a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0)
 	err = a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0, map[string]interface{}{
-		"Transport": "le",
+		"Transport": "auto",
 	}).Err
 	if err != nil {
 		return err
@@ -620,6 +620,11 @@ func (d Device) Disconnect() error {
 // changing the connection latency.
 func (d Device) RequestConnectionParams(params ConnectionParams) error {
 	return nil
+}
+
+// PowerOn powers on the Bluetooth adapter.
+func (a *Adapter) PowerOn() error {
+	return a.adapter.SetProperty("org.bluez.Adapter1.Powered", dbus.MakeVariant(true))
 }
 
 // SetRandomAddress sets the random address to be used for advertising.
