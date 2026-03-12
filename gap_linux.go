@@ -5,9 +5,11 @@ package bluetooth
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
@@ -501,10 +503,16 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	// Already start watching for property changes. We do this before reading
 	// the Connected property below to avoid a race condition: if the device
 	// were connected between the two calls the signal wouldn't be picked up.
-	signal := make(chan *dbus.Signal)
+	signal := make(chan *dbus.Signal, 16)
 	a.bus.Signal(signal)
-	defer close(signal)
 	defer a.bus.RemoveSignal(signal)
+	defer func() {
+		// Drain and close so any blocked godbus sender is unblocked.
+		for len(signal) > 0 {
+			<-signal
+		}
+		close(signal)
+	}()
 	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
 	a.bus.AddMatchSignal(propertiesChangedMatchOptions...)
 	defer a.bus.RemoveMatchSignal(propertiesChangedMatchOptions...)
@@ -563,7 +571,11 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 				}
 			}
 		}()
-		<-connectChan
+		select {
+		case <-connectChan:
+		case <-time.After(30 * time.Second):
+			return Device{}, fmt.Errorf("bluetooth: timed out waiting for connection")
+		}
 
 		if err != nil {
 			return Device{}, err
@@ -580,17 +592,13 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 // Remove removes this device from the adapter
 // This will unpair the device and remove it from BlueZ's cache
 func (d Device) Remove() error {
-	// Disconnect first if connected (ignore error — device may not exist in BlueZ yet).
-	if connected, err := d.IsConnected(); err == nil && connected {
-		d.Disconnect()
-	}
-
 	// Call the connect handler if set
 	if d.adapter.connectHandler != nil {
 		d.adapter.connectHandler(d, false)
 	}
 
-	// Remove the device from the adapter
+	// RemoveDevice handles disconnection internally; calling Disconnect first
+	// can hang if the device is in a connecting/pairing state.
 	call := d.adapter.adapter.Call("org.bluez.Adapter1.RemoveDevice", 0, d.device.Path())
 	if call.Err != nil {
 		if dbusErr, ok := call.Err.(dbus.Error); ok && dbusErr.Name == "org.bluez.Error.DoesNotExist" {
@@ -625,6 +633,15 @@ func (d Device) RequestConnectionParams(params ConnectionParams) error {
 // PowerOn powers on the Bluetooth adapter.
 func (a *Adapter) PowerOn() error {
 	return a.adapter.SetProperty("org.bluez.Adapter1.Powered", dbus.MakeVariant(true))
+}
+
+// SetPairable sets the adapter pairable state and optionally a timeout in seconds.
+// A timeout of 0 means pairable indefinitely.
+func (a *Adapter) SetPairable(pairable bool, timeoutSecs uint32) error {
+	if err := a.adapter.SetProperty("org.bluez.Adapter1.Pairable", dbus.MakeVariant(pairable)); err != nil {
+		return err
+	}
+	return a.adapter.SetProperty("org.bluez.Adapter1.PairableTimeout", dbus.MakeVariant(timeoutSecs))
 }
 
 // SetRandomAddress sets the random address to be used for advertising.
@@ -914,58 +931,79 @@ func (a *agent) Unregister() error {
 
 // RequestPinCode is called when BlueZ needs a PIN code for legacy pairing
 func (agent *agent) RequestPinCode(device dbus.ObjectPath) (string, *dbus.Error) {
+	log.Printf("[BT agent] RequestPinCode called for device %s", device)
 	if agent.pinCodeHandler != nil {
-		return agent.pinCodeHandler(device), nil
+		pin := agent.pinCodeHandler(device)
+		log.Printf("[BT agent] RequestPinCode returning %q", pin)
+		return pin, nil
 	}
+	log.Printf("[BT agent] RequestPinCode: no handler set")
 	return "", dbus.MakeFailedError(fmt.Errorf("no PIN code handler set"))
 }
 
 // RequestPasskey is called when BlueZ needs a numeric passkey (6-digit)
 func (agent *agent) RequestPasskey(device dbus.ObjectPath) (uint32, *dbus.Error) {
+	log.Printf("[BT agent] RequestPasskey called for device %s", device)
 	if agent.passkeyHandler != nil {
-		return agent.passkeyHandler(device), nil
+		key := agent.passkeyHandler(device)
+		log.Printf("[BT agent] RequestPasskey returning %d", key)
+		return key, nil
 	}
 	// Fallback to pin code handler if passkey handler not set
 	if agent.pinCodeHandler != nil {
 		pinCode := agent.pinCodeHandler(device)
 		var passkey uint32
 		fmt.Sscanf(pinCode, "%d", &passkey)
+		log.Printf("[BT agent] RequestPasskey fallback from pin %q -> %d", pinCode, passkey)
 		return passkey, nil
 	}
+	log.Printf("[BT agent] RequestPasskey: no handler set")
 	return 0, dbus.MakeFailedError(fmt.Errorf("no passkey or PIN code handler set"))
 }
 
 // RequestConfirmation is called for "Just Works" pairing or to confirm a passkey
 func (agent *agent) RequestConfirmation(device dbus.ObjectPath, passkey uint32) *dbus.Error {
+	log.Printf("[BT agent] RequestConfirmation called for device %s passkey %06d", device, passkey)
 	if agent.confirmationHandler != nil {
-		if agent.confirmationHandler(device, passkey) {
+		ok := agent.confirmationHandler(device, passkey)
+		log.Printf("[BT agent] RequestConfirmation handler returned %v", ok)
+		if ok {
 			return nil
 		}
 		return dbus.MakeFailedError(fmt.Errorf("confirmation rejected"))
 	}
-	return nil // Auto-confirm if no handler set
+	log.Printf("[BT agent] RequestConfirmation: auto-confirming (no handler)")
+	return nil
 }
 
 // RequestAuthorization is called to authorize a connection
 func (agent *agent) RequestAuthorization(device dbus.ObjectPath) *dbus.Error {
+	log.Printf("[BT agent] RequestAuthorization called for device %s", device)
 	if agent.authorizationHandler != nil {
-		if agent.authorizationHandler(device) {
+		ok := agent.authorizationHandler(device)
+		log.Printf("[BT agent] RequestAuthorization handler returned %v", ok)
+		if ok {
 			return nil
 		}
 		return dbus.MakeFailedError(fmt.Errorf("authorization rejected"))
 	}
-	return nil // Auto-authorize if no handler set
+	log.Printf("[BT agent] RequestAuthorization: auto-authorizing (no handler)")
+	return nil
 }
 
 // AuthorizeService is called to authorize access to a specific service
 func (agent *agent) AuthorizeService(device dbus.ObjectPath, uuid string) *dbus.Error {
+	log.Printf("[BT agent] AuthorizeService called for device %s uuid %s", device, uuid)
 	if agent.serviceAuthorizationHandler != nil {
-		if agent.serviceAuthorizationHandler(device, uuid) {
+		ok := agent.serviceAuthorizationHandler(device, uuid)
+		log.Printf("[BT agent] AuthorizeService handler returned %v", ok)
+		if ok {
 			return nil
 		}
 		return dbus.MakeFailedError(fmt.Errorf("service authorization rejected"))
 	}
-	return nil // Auto-authorize if no handler set
+	log.Printf("[BT agent] AuthorizeService: auto-authorizing (no handler)")
+	return nil
 }
 
 // Cancel is called when the authentication request is canceled
